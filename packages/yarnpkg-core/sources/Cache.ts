@@ -1,17 +1,18 @@
-import {formatUtils}                                             from '@yarnpkg/core';
-import {FakeFS, LazyFS, NodeFS, PortablePath, Filename, AliasFS} from '@yarnpkg/fslib';
-import {ppath, xfs}                                              from '@yarnpkg/fslib';
-import {ZipFS}                                                   from '@yarnpkg/libzip';
-import {randomBytes}                                             from 'crypto';
-import fs                                                        from 'fs';
+import {formatUtils}                                                       from '@yarnpkg/core';
+import {FakeFS, LazyFS, NodeFS, PortablePath, Filename, AliasFS}           from '@yarnpkg/fslib';
+import {ppath, xfs}                                                        from '@yarnpkg/fslib';
+import {ZipFS}                                                             from '@yarnpkg/libzip';
+import {randomBytes}                                                       from 'crypto';
+import fs                                                                  from 'fs';
 
-import {Configuration}                                           from './Configuration';
-import {MessageName}                                             from './MessageName';
-import {ReportError}                                             from './Report';
-import * as hashUtils                                            from './hashUtils';
-import * as miscUtils                                            from './miscUtils';
-import * as structUtils                                          from './structUtils';
-import {LocatorHash, Locator}                                    from './types';
+import {Configuration}                                                     from './Configuration';
+import {MessageName}                                                       from './MessageName';
+import {ReportError}                                                       from './Report';
+import * as hashUtils                                                      from './hashUtils';
+import * as miscUtils                                                      from './miscUtils';
+import {addToNixStore, getNameFromNixStorePath, getNixStorePath, nixDebug} from './nixUtils';
+import * as structUtils                                                    from './structUtils';
+import {LocatorHash, Locator}                                              from './types';
 
 /**
  * If value defines the minimal cache version we can read files from. We need
@@ -117,6 +118,9 @@ export class Cache {
 
     this.cacheSpec = cacheSpec;
     this.cacheKey = cacheKey;
+
+    const {plugins, env, settings, ...config} = this.configuration;
+    nixDebug(`Cache.constructor`, {...this, configuration: config});
   }
 
   get mirrorCwd() {
@@ -177,18 +181,24 @@ export class Cache {
   }
 
   getLocatorPath(locator: Locator, expectedChecksum: string | null) {
+    if (expectedChecksum === null) {
+      nixDebug(`getLocatorPath no expectedChecksum`);
+      return ppath.resolve(this.cwd, this.getVersionFilename(locator));
+    }
     // When using the global cache we want the archives to be named as per
     // the cache key rather than the hash, as otherwise we wouldn't be able
     // to find them if we didn't have the hash (which is the case when adding
     // new dependencies to a project).
-    if (this.mirrorCwd === null)
-      return ppath.resolve(this.cwd, this.getVersionFilename(locator));
-
     // Same thing if we don't know the checksum; it means that the package
     // doesn't support being checksum'd (unstablePackage), so we fallback
     // on the versioned filename.
-    if (expectedChecksum === null)
-      return ppath.resolve(this.cwd, this.getVersionFilename(locator));
+    if (this.mirrorCwd === null) {
+      nixDebug(`getLocatorPath no mirrorCwd`);
+      const path = ppath.resolve(this.cwd, this.getVersionFilename(locator));
+      // return path
+      const contentChecksum = splitChecksumComponents(expectedChecksum).hash;
+      return getNixStorePath(path, contentChecksum) as PortablePath;
+    }
 
     return ppath.resolve(this.cwd, this.getChecksumFilename(locator, expectedChecksum));
   }
@@ -222,6 +232,7 @@ export class Cache {
 
   async fetchPackageFromCache(locator: Locator, expectedChecksum: string | null, {onHit, onMiss, loader, ...opts}: {onHit?: () => void, onMiss?: () => void, loader?: () => Promise<ZipFS>} & CacheOptions): Promise<[FakeFS<PortablePath>, () => void, string | null]> {
     const mirrorPath = this.getLocatorMirrorPath(locator);
+    nixDebug(`Cache.fetchPackageFromCache`, {locator, expectedChecksum, loader, mirrorPath});
 
     const baseFs = new NodeFS();
 
@@ -263,6 +274,8 @@ export class Cache {
     };
 
     const validateFile = async (path: PortablePath, {isColdHit, controlPath = null}: ValidateFileOptions): Promise<{isValid: boolean, hash: string | null}> => {
+      nixDebug(`Cache.validateFile`, {path, isColdHit, controlPath});
+
       // We hide the checksum if the package presence is conditional, because it becomes unreliable
       // so there is no point in computing it unless we're checking the cache
       if (controlPath === null && opts.unstablePackages?.has(locator.locatorHash))
@@ -319,6 +332,7 @@ export class Cache {
     };
 
     const validateFileAgainstRemote = async (cachePath: PortablePath) => {
+      nixDebug(`Cache.validateFileAgainstRemote`);
       if (!loader)
         throw new Error(`Cache check required but no loader configured for ${structUtils.prettyLocator(this.configuration, locator)}`);
 
@@ -341,6 +355,7 @@ export class Cache {
     };
 
     const loadPackageThroughMirror = async () => {
+      nixDebug(`Cache.loadPackageThroughMirror`, {mirrorPath});
       if (mirrorPath === null || !(await xfs.existsPromise(mirrorPath))) {
         const zipFs = await loader!();
         const realPath = zipFs.getRealPath();
@@ -352,6 +367,7 @@ export class Cache {
     };
 
     const loadPackage = async () => {
+      nixDebug(`Cache.loadPackage`);
       if (!loader)
         throw new Error(`Cache entry required but missing for ${structUtils.prettyLocator(this.configuration, locator)}`);
 
@@ -376,6 +392,7 @@ export class Cache {
           await xfs.chmodPromise(mirrorPathTemp, 0o644);
           // Doing a rename is important to ensure the cache is atomic
           await xfs.renamePromise(mirrorPathTemp, mirrorPath);
+          nixDebug(`Cache.copyProcess 1`,  {mirrorPathTemp, packagePath, mirrorPath});
         });
       }
 
@@ -383,10 +400,22 @@ export class Cache {
       if (!opts.mirrorWriteOnly || mirrorPath === null) {
         copyProcess.push(async () => {
           const cachePathTemp = `${cachePath}${this.cacheId}` as PortablePath;
-          await xfs.copyFilePromise(packagePath, cachePathTemp, fs.constants.COPYFILE_FICLONE);
-          await xfs.chmodPromise(cachePathTemp, 0o644);
-          // Doing a rename is important to ensure the cache is atomic
-          await xfs.renamePromise(cachePathTemp, cachePath);
+          if (checksum == null) {
+            await xfs.copyFilePromise(packagePath, cachePathTemp, fs.constants.COPYFILE_FICLONE);
+            await xfs.chmodPromise(cachePathTemp, 0o644);
+            // Doing a rename is important to ensure the cache is atomic
+            await xfs.renamePromise(cachePathTemp, cachePath);
+          } else {
+            const contentChecksum = splitChecksumComponents(checksum).hash;
+
+            await addToNixStore({
+              filePath: packagePath,
+              targetfileName: getNameFromNixStorePath(cachePath),
+              checksum: contentChecksum,
+              cwd: this.cwd,
+            });
+          }
+          nixDebug(`Cache.copyProcess`,  {cachePathTemp, packagePath, cachePath});
         });
       }
 
@@ -395,11 +424,14 @@ export class Cache {
         : cachePath;
 
       await Promise.all(copyProcess.map(copy => copy()));
+      nixDebug(`finalPath`, finalPath);
 
       return [false, finalPath, checksum] as const;
     };
 
     const loadPackageThroughMutex = async () => {
+      nixDebug(`Cache.loadPackageThroughMutex`);
+
       const mutexedLoad = async () => {
         const isUnstablePackage = opts.unstablePackages?.has(locator.locatorHash);
 
@@ -464,6 +496,8 @@ export class Cache {
 
     const [shouldMock, cachePath, checksum] = await loadPackageThroughMutex();
 
+    nixDebug(`Cache:`, {cachePath, checksum});
+
     if (!shouldMock)
       this.markedFiles.add(cachePath);
 
@@ -491,6 +525,8 @@ export class Cache {
     const exposedChecksum = !opts.unstablePackages?.has(locator.locatorHash)
       ? checksum
       : null;
+
+    nixDebug(`Cache:`, {exposedChecksum});
 
     return [aliasFs, releaseFs, exposedChecksum];
   }

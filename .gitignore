@@ -47,3 +47,4 @@ package.tgz
 .idea
 
 coverage
+.direnv
